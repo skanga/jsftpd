@@ -8,6 +8,9 @@ import org.apache.sshd.server.auth.password.PasswordAuthenticator;
 import org.apache.sshd.server.config.keys.AuthorizedKeysAuthenticator;
 import org.apache.sshd.server.keyprovider.SimpleGeneratorHostKeyProvider;
 import org.apache.sshd.server.session.ServerSession;
+import org.apache.sshd.sftp.server.FileHandle;
+import org.apache.sshd.sftp.server.Handle;
+import org.apache.sshd.sftp.server.SftpEventListener;
 import org.apache.sshd.sftp.server.SftpSubsystemFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.SpringApplication;
@@ -17,13 +20,13 @@ import org.springframework.stereotype.Service;
 import javax.annotation.PostConstruct;
 import java.io.IOException;
 import java.net.InetAddress;
-import java.net.NetworkInterface;
-import java.net.UnknownHostException;
+import java.nio.file.CopyOption;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.Collection;
 import java.util.Collections;
-import java.util.Enumeration;
+import java.util.HashMap;
 import java.util.Map;
 
 // sftp -oPort=9090 test1@localhost
@@ -32,25 +35,25 @@ public class jsftpd
 {
     public static void main(String[] args) throws InterruptedException
     {
-        SpringApplication.run(SftpServer.class, args);
+        SpringApplication.run(SFTPServerApp.class, args);
         Thread.currentThread().join();
     }
 }
 
 @Service
-class SftpServer
+class SFTPServerApp
 {
-    private final Log sftpLogger = LogFactory.getLog(SftpServer.class);
-    @Value ("${jsftpd.host}")
+    private final Log sftpLogger = LogFactory.getLog(SFTPServerApp.class);
+    @Value ("${jssh.host:}")
     private String jsftpdHost;
-    @Value ("${jsftpd.port}")
+    @Value ("${jssh.port:0}")
     private int jsftpdPort;
-    @Value ("${jsftpd.privkey}")
+    @Value ("${jssh.privkey}")
     private String jsftpdPrivateKey;
-    @Value ("${jsftpd.authkeys}")
+    @Value ("${jssh.authkeys}")
     private String jsftpdAuthkeys;
-    @Value ("#{${jsftpd.users}}")
-    private Map <String, String> users;
+    @Value ("#{${jssh.users}}")
+    private Map <String, String> userCreds;
 
     @PostConstruct
     public void startServer() throws IOException
@@ -61,21 +64,74 @@ class SftpServer
     private void start() throws IOException
     {
         SshServer sshd = SshServer.setUpDefaultServer();
-        sshd.setHost(jsftpdHost);
+        if (!jsftpdHost.equals(""))
+            sshd.setHost(jsftpdHost);
         sshd.setPort(jsftpdPort);
 
         // Creating a host private key which should be stored in a secure location,
         sshd.setKeyPairProvider(new SimpleGeneratorHostKeyProvider(Paths.get(jsftpdPrivateKey)));
-        sshd.setSubsystemFactories(Collections.singletonList(new SftpSubsystemFactory()));
         sshd.setIoServiceFactoryFactory(new Nio2ServiceFactoryFactory());
         sshd.setPasswordAuthenticator(new PasswordAuthenticator()
         {
             @Override
-            public boolean authenticate(String username, String password, ServerSession session)
+            public boolean authenticate(String userName, String passWord, ServerSession session)
             {
-                return users.get(username).equals(password);
+                return userCreds.get(userName).equals(passWord);
             }
         });
+
+        SftpSubsystemFactory sftp = new SftpSubsystemFactory();
+        sftp.addSftpEventListener(new SftpEventListener()
+        {
+            private final Map<ServerSession, String> writtenFilePath = new HashMap <>();
+            private final Map<ServerSession, String> readFilePath = new HashMap <>();
+
+            @Override
+            public void read(ServerSession session, String remoteHandle, FileHandle localHandle, long offset, byte[] data, int dataOffset, int dataLen, int readLen, Throwable thrown) throws IOException
+            {
+                SftpEventListener.super.read(session, remoteHandle, localHandle, offset, data, dataOffset, dataLen, readLen, thrown);
+                readFilePath.put(session, localHandle.getFile().toString());
+            }
+
+            @Override
+            public void written(ServerSession session, String remoteHandle, FileHandle localHandle, long offset,
+                                byte[] data, int dataOffset, int dataLen, Throwable thrown) throws IOException
+            {
+                SftpEventListener.super.written(session, remoteHandle, localHandle, offset, data, dataOffset, dataLen, thrown);
+                writtenFilePath.put(session, localHandle.getFile().toString());
+            }
+
+            @Override
+            public void closed(ServerSession session, String remoteHandle, Handle localHandle, Throwable thrown)
+            {
+                if (writtenFilePath.containsKey(session))
+                    sftpLogger.info("[SFTP_EVENT] session:" + session + " written file: " + writtenFilePath.remove(session));
+                else if (readFilePath.containsKey(session))
+                    sftpLogger.info("[SFTP_EVENT] session:" + session + " read file: " + readFilePath.remove(session));
+            }
+
+            @Override
+            public void removed(ServerSession session, Path path, boolean isDirectory, Throwable thrown) throws IOException
+            {
+                SftpEventListener.super.removed(session, path, isDirectory, thrown);
+                sftpLogger.info("[SFTP_EVENT] session:" + session + " removed " + (isDirectory ? "directory" : "file") + ": " + path);
+            }
+
+            @Override
+            public void created(ServerSession session, Path path, Map<String, ?> attrs, Throwable thrown) throws IOException
+            {
+                SftpEventListener.super.created(session, path, attrs, thrown);
+                sftpLogger.info("[SFTP_EVENT] session:" + session + " created directory: " + path);
+            }
+
+            @Override
+            public void moved(ServerSession session, Path srcPath, Path dstPath, Collection <CopyOption> opts, Throwable thrown) throws IOException
+            {
+                SftpEventListener.super.moved(session, srcPath, dstPath, opts, thrown);
+                sftpLogger.info("[SFTP_EVENT] session:" + session + " moved path src:" + srcPath + " dst:" + dstPath);
+            }
+        });
+        sshd.setSubsystemFactories(Collections.singletonList(sftp));
 
         // We can add the public key of the client, usually stored in ~/.ssh/authorized_keys if that file is configured correctly
         Path authKeys = Paths.get(jsftpdAuthkeys);
@@ -83,76 +139,9 @@ class SftpServer
             sshd.setPublickeyAuthenticator(new AuthorizedKeysAuthenticator(authKeys));
         sshd.start();
 
-
         sftpLogger.info("Hostname: " + InetAddress.getLocalHost().getHostName());
         sftpLogger.info("Localhost IP address: " + InetAddress.getLocalHost().getHostAddress());
-        sftpLogger.info("LAN IP address: " + getLocalHostLANAddress().getHostAddress());
-
+        sftpLogger.info("LAN IP address: " + Util.getLocalHostLANAddress().getHostAddress());
         sftpLogger.info("SFTP server starting on port: " + jsftpdPort);
-    }
-
-    /**
-     * Returns an InetAddress object encapsulating what is most likely the machine's LAN IP address.
-     * This method will scan all IP addresses on all network interfaces on the host machine to determine
-     * the IP address most likely to be the machine's LAN address. If the machine has multiple IP addresses,
-     * this method will prefer a site-local IP address (e.g. 192.168.x.x or 10.10.x.x, usually IPv4) if the
-     * machine has one (and will return the first site-local address if the machine has more than one), but
-     * if the machine does not hold a site-local address, this method will return simply the first non-loopback
-     * address found (IPv4 or IPv6).
-     */
-    private static InetAddress getLocalHostLANAddress() throws UnknownHostException
-    {
-        try
-        {
-            InetAddress candidateAddress = null;
-            // Iterate all NICs (network interface cards)...
-            for (Enumeration <NetworkInterface> networkInterfaces = NetworkInterface.getNetworkInterfaces(); networkInterfaces.hasMoreElements(); )
-            {
-                NetworkInterface networkInterface = networkInterfaces.nextElement();
-                // Iterate all IP addresses assigned to each card...
-                for (Enumeration <InetAddress> inetAddrs = networkInterface.getInetAddresses(); inetAddrs.hasMoreElements(); )
-                {
-                    InetAddress inetAddr = inetAddrs.nextElement();
-                    if (!inetAddr.isLoopbackAddress())
-                    {
-                        if (inetAddr.isSiteLocalAddress())
-                        {
-                            // Found non-loopback site-local address. Return it immediately...
-                            return inetAddr;
-                        }
-                        else if (candidateAddress == null)
-                        {
-                            // Found non-loopback address, but not necessarily site-local.
-                            // Store it as a candidate to be returned if site-local address is not subsequently found...
-                            candidateAddress = inetAddr;
-                            // Note that we don't repeatedly assign non-loopback non-site-local addresses as candidates,
-                            // only the first. For subsequent iterations, candidate will be non-null.
-                        }
-                    }
-                }
-            }
-            if (candidateAddress != null)
-            {
-                // We did not find a site-local address, but we found some other non-loopback address.
-                // Server might have a non-site-local address assigned to its NIC (or it might be running
-                // IPv6 which deprecates the "site-local" concept).
-                // Return this non-loopback candidate address...
-                return candidateAddress;
-            }
-            // At this point, we did not find a non-loopback address.
-            // Fall back to returning whatever InetAddress.getLocalHost() returns...
-            InetAddress jdkSuppliedAddress = InetAddress.getLocalHost();
-            if (jdkSuppliedAddress == null)
-            {
-                throw new UnknownHostException("The JDK InetAddress.getLocalHost() method unexpectedly returned null.");
-            }
-            return jdkSuppliedAddress;
-        }
-        catch (Exception e)
-        {
-            UnknownHostException unknownHostException = new UnknownHostException("Failed to determine LAN address: " + e);
-            unknownHostException.initCause(e);
-            throw unknownHostException;
-        }
     }
 }
