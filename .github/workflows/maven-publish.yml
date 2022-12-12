@@ -15,10 +15,6 @@ jobs:
     # runs-on: windows-latest
     # runs-on: macos-latest
 
-    permissions:
-      contents: read
-      packages: write
-
     steps:
     # The checkout step downloads a copy of your repository on the runner
     - uses: actions/checkout@v3
@@ -36,6 +32,8 @@ jobs:
     # "Build with Maven" step runs the Maven package target in non-interactive mode
     - name: Build with Maven
       run: mvn --batch-mode --update-snapshots package
+      env:
+        GITHUB_TOKEN: ${{ secrets.TOKEN }}
 
     - run: mkdir staging && cp target/*.jar staging
     - uses: actions/upload-artifact@v3
@@ -47,3 +45,12 @@ jobs:
     #  run: mvn deploy -s $GITHUB_WORKSPACE/settings.xml
     #  env:
     #    GITHUB_TOKEN: ${{ github.token }}
+  publish:
+
+    runs-on: ubuntu-latest
+    # runs-on: windows-latest
+    # runs-on: macos-latest
+
+    permissions:
+      contents: read
+      packages: write
