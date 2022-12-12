@@ -3,9 +3,10 @@
 
 name: Java CI to run mvn package
 
-on:
-  release:
-    types: [created]
+#on:
+#  release:
+#    types: [created]
+on: [push]
 
 jobs:
   build:
